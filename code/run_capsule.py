@@ -1,20 +1,22 @@
 import h5py
 import numpy as np
-from pynwb import NWBFile, NWBHDF5IO, ProcessingModule
-from pynwb.ophys import Fluorescence, RoiResponseSeries
+import pynwb
 from datetime import datetime
 from pathlib import Path
-import pynwb
+from openscope_upload import harp_utils
 
+
+data_folder = Path("../data")
+results_folder = Path("../results")
 
 def main():
-    asset_path = r"\\allen\aind\scratch\OpenScope\Slap2\Data\801381\801381_20250605T145742"
-    asset_path = Path(asset_path)
+    asset_path = data_folder / "slap2_session"
     h5_path = next(asset_path.rglob("experiment_summary.h5"))
     print("Found h5 file:", h5_path)
-    nwb_path = "./results/output.nwb"
+    nwb_path = results_folder / "output.nwb"
     session_json_path = next(asset_path.glob("session.json"))
     rig_json_path = next(asset_path.glob("rig.json"))
+    harp_path = next(asset_path.rglob('.harp'))
     import json
     with open(session_json_path, "r") as f:
         session_json = json.load(f)
@@ -22,7 +24,8 @@ def main():
         rig_json = json.load(f)
     with h5py.File(h5_path, "r") as h5:
         nwbfile, nwb_io = create_nwb_file(nwb_path)
-        add_ophys_to_nwb(nwbfile, h5, rig_json)
+        harp_data = harp_utils.extract_harp(harp_path)
+        add_ophys_to_nwb(nwbfile, h5, rig_json, harp_data)
         nwb_io.write(nwbfile)
         nwb_io.close()
 
@@ -34,7 +37,7 @@ def create_nwb_file(nwb_path):
     Returns: (nwbfile, nwb_io)
     """
     subject_info = {}  # TODO: extract from h5 or elsewhere
-    nwbfile = NWBFile(
+    nwbfile = pynwb.NWBFile(
         session_description='Session description placeholder',
         identifier='unique_id_placeholder',
         session_start_time=datetime.now(),
@@ -44,7 +47,7 @@ def create_nwb_file(nwb_path):
         session_id='session_id_placeholder',
         subject=None  # TODO: create pynwb.Subject from subject_info
     )
-    nwb_io = NWBHDF5IO(str(nwb_path), 'w')
+    nwb_io = pynwb.NWBHDF5IO(str(nwb_path), 'w')
     return nwbfile, nwb_io
 
 
@@ -74,15 +77,28 @@ def create_imaging_plane(nwbfile, dmd_name, optical_channel, device, rig_json):
     return imaging_plane
 
 
+def get_pixel_mask(mask):
+    """
+    Given a 2D mask (full FOV), return a list of (row, col, weight) triplets for all nonzero and non-nan pixels.
+    This is the NWB-compliant, space-efficient way to store ROIs for large FOVs.
+    Returns: pixel_mask (list of (row, col, weight))
+    """
+    valid = np.logical_and(mask != 0, ~np.isnan(mask))
+    rows, cols = np.where(valid)
+    weights = mask[rows, cols]
+    pixel_mask = [(int(r), int(c), float(w)) for r, c, w in zip(rows, cols, weights)]
+    return pixel_mask
+
+
 def add_image_segmentation(h5, imaging_plane, dmd_name, image_segmentation):
     """
     Add a PlaneSegmentation for a DMD to the shared ImageSegmentation object.
+    For each ROI, store a pixel_mask (list of (row, col, weight)) for space-efficient NWB compliance.
     h5: Open HDF5 file handle.
     imaging_plane: ImagingPlane object for this DMD.
     dmd_name: Name of the DMD/plane (e.g., 'DMD1').
     image_segmentation: Shared ImageSegmentation object for the ophys module.
     Returns: DynamicTableRegion referencing all ROIs for this plane.
-    Note: Uses fp_masks as boolean ROI masks; each mask is (height, width).
     """
     ps = image_segmentation.create_plane_segmentation(
         name=f"PlaneSegmentation_{dmd_name}",
@@ -90,10 +106,10 @@ def add_image_segmentation(h5, imaging_plane, dmd_name, image_segmentation):
         imaging_plane=imaging_plane
     )
     fp_masks = h5[dmd_name]['sources']['spatial']['fp_masks'][()]
-    fp_coords = h5[dmd_name]['sources']['spatial']['fp_coords'][()]
     n_rois = fp_masks.shape[0]
     for mask in fp_masks:
-        ps.add_roi(image_mask=mask)
+        pixel_mask = get_pixel_mask(mask)
+        ps.add_roi(pixel_mask=pixel_mask)
     roi_table_region = ps.create_roi_table_region(
         region=list(range(n_rois)),
         description=f"All ROIs for {dmd_name}"
@@ -101,7 +117,7 @@ def add_image_segmentation(h5, imaging_plane, dmd_name, image_segmentation):
     return roi_table_region
 
 
-def add_fluorescence(h5, dmd_name, roi_table, ophys_mod):
+def add_fluorescence(h5, dmd_name, roi_table, ophys_mod, harp_data):
     """
     Add Fluorescence and dFF traces for a DMD to the NWBFile.
     h5: Open HDF5 file handle.
@@ -112,12 +128,16 @@ def add_fluorescence(h5, dmd_name, roi_table, ophys_mod):
     """
     dmd_group = h5[dmd_name]
     temporal_sources = dmd_group['sources']['temporal']
+    print("temporal sources:", temporal_sources, temporal_sources.keys())
     f0_data = temporal_sources['F0'][()]
     dff_data = temporal_sources['dFF'][()]
-    timestamps = np.arange(f0_data.shape[0], dtype=float)
-    fluorescence = Fluorescence(name=f"Fluorescence_{dmd_name}")
+    print(dmd_group, dmd_group.keys())
+    trial_start_idxs = dmd_group['frame_info']['trial_start_idxs'][()]
+    timestamps = harp_utils.get_concatenated_timestamps(f0_data, trial_start_idxs, harp_data)
+    assert len(timestamps) == f0_data.shape[0], "Timestamps and fluorescence trace must have same length"
+    fluorescence = pynwb.ophys.Fluorescence(name=f"Fluorescence_{dmd_name}")
     ophys_mod.add_data_interface(fluorescence)
-    rrs_f0 = RoiResponseSeries(
+    rrs_f0 = pynwb.ophys.RoiResponseSeries(
         name=f"{dmd_name}_F0",
         data=f0_data,
         rois=roi_table,
@@ -126,7 +146,7 @@ def add_fluorescence(h5, dmd_name, roi_table, ophys_mod):
         description=f"F0 (raw fluorescence) traces from {dmd_name}"
     )
     fluorescence.add_roi_response_series(rrs_f0)
-    rrs_dff = RoiResponseSeries(
+    rrs_dff = pynwb.ophys.RoiResponseSeries(
         name=f"{dmd_name}_dFF",
         data=dff_data,
         rois=roi_table,
@@ -137,22 +157,37 @@ def add_fluorescence(h5, dmd_name, roi_table, ophys_mod):
     fluorescence.add_roi_response_series(rrs_dff)
 
 
-def add_mean_images(nwbfile, h5, dmd_name):
+def add_mean_images(h5, dmd_name, ophys_mod):
     """
-    Add mean and activity images for a DMD to the NWBFile acquisitions.
-    nwbfile: NWBFile object to add images to.
-    h5: Open HDF5 file handle.
-    dmd_name: Name of the DMD/plane (e.g., 'DMD1').
-    For mean image, each channel is stored as a separate Image object.
-    For activity image, only the first channel is stored.
+    Add registered and motion-corrected mean and activity images for a DMD to the ophys ProcessingModule as ImageSeries objects.
+    mean_im: shape (channels, height, width) from HDF5.
+    act_im: shape (height, width) from HDF5.
+    Each channel of the mean image is stored as a single-frame ImageSeries.
+    The activity image is stored as a single-frame ImageSeries.
     """
     mean_im = h5[dmd_name]['visualizations']['mean_im'][()]
     act_im = h5[dmd_name]['visualizations']['act_im'][()]
+    if mean_im.ndim == 2: # should be (channels, height, width), add dim if only one channel
+        mean_im = mean_im[None, ...]
     for ch in range(mean_im.shape[0]):
-        mean_image = pynwb.image.Image(name=f"{dmd_name}_mean_image_channel{ch}", data=mean_im[ch])
-        nwbfile.add_acquisition(mean_image)
-    act_image = pynwb.image.Image(name=f"{dmd_name}_activity_image", data=act_im[0])
-    nwbfile.add_acquisition(act_image)
+        mean_image_series = pynwb.image.ImageSeries(
+            name=f"{dmd_name}_mean_image_channel{ch}",
+            data=mean_im[ch][None, ...],  # shape (1, height, width)
+            unit='a.u.',
+            format='raw',
+            timestamps=[0.0],
+            description=f"Registered mean image for {dmd_name}, channel {ch} (motion corrected)"
+        )
+        ophys_mod.add_data_interface(mean_image_series)
+    act_image_series = pynwb.image.ImageSeries(
+        name=f"{dmd_name}_activity_image",
+        data=act_im[None, ...],  # shape (1, height, width)
+        unit='a.u.',
+        format='raw',
+        timestamps=[0.0],
+        description=f"Registered activity image for {dmd_name} (motion corrected)"
+    )
+    ophys_mod.add_data_interface(act_image_series)
 
 
 def create_device(nwbfile, rig_json):
@@ -192,7 +227,7 @@ def create_optical_channel(rig_json, dmd_name):
     )
 
 
-def add_ophys_to_nwb(nwbfile, h5, rig_json):
+def add_ophys_to_nwb(nwbfile, h5, rig_json, harp_data):
     """
     Build the full ophys structure in the NWB file, iterating over DMDs (planes).
     For each DMD, create imaging plane, ROI table, add fluorescence, and add mean images.
@@ -209,8 +244,8 @@ def add_ophys_to_nwb(nwbfile, h5, rig_json):
         optical_channel = create_optical_channel(rig_json, dmd_name)
         imaging_plane = create_imaging_plane(nwbfile, dmd_name, optical_channel, device, rig_json)
         roi_table = add_image_segmentation(h5, imaging_plane, dmd_name, image_segmentation)
-        add_fluorescence(h5, dmd_name, roi_table, ophys_mod)
-        add_mean_images(nwbfile, h5, imaging_plane, dmd_name)
+        add_fluorescence(h5, dmd_name, roi_table, ophys_mod, harp_data)
+        add_mean_images(h5, dmd_name, ophys_mod)
 
 
 if __name__ == "__main__":
